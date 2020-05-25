@@ -1,0 +1,19 @@
+[package]
+name = "test_gtask"
+version = "0.1.0"
+authors = ["Scott Hutton <schutton@cisco.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+gio-sys = "0.9.1"
+glib = "0.9.3"
+gobject-sys = "0.9.1"
+glib-sys = "0.9.1"
+tokio = { version = "0.2.21", features = ["full"] }
+
+[lib]
+name = "rust_gtask"
+path = "src/lib.rs"
+crate-type = ["lib", "cdylib"]

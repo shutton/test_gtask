@@ -1,0 +1,17 @@
+/target
+Cargo.lock
+config.log
+config.status
+configure
+compile
+depcomp
+install-sh
+missing
+Makefile.in
+aclocal.m4
+Makefile
+autom4te.cache/
+INSTALL
+*.o
+*.Po
+src/rust_gtask
