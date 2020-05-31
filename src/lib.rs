@@ -19,7 +19,10 @@ enum SomeMsg {
 
 #[no_mangle]
 pub fn rs_do_something_finish(_src: GObject, _result: GAsyncResult, _error: &mut GError) -> usize {
-    eprintln!("Thanks for calling my finish function!");
+    eprintln!(
+        "{:?} !rs_do_something_finish() called",
+        std::thread::current()
+    );
     // TODO: cast GAsyncResult back to the task and unref it?
 
     1
@@ -27,22 +30,25 @@ pub fn rs_do_something_finish(_src: GObject, _result: GAsyncResult, _error: &mut
 
 async fn rs_worker(mut receiver: futures::channel::mpsc::Receiver<SomeMsg>) {
     loop {
-        eprintln!("thread waiting...");
+        eprintln!("{:?} thread waiting...", std::thread::current());
         while let Some(msg) = receiver.next().await {
-            eprintln!("msg: {:?}", msg);
-            match msg {
-                SomeMsg::Task(task) => {
-                    let task = *task.lock().unwrap() as *mut GTask;
-                    unsafe { g_task_return_boolean(task, 1) }
+            // Perform every task in an available worker thread rather than this one
+            tokio::spawn(async move {
+                eprintln!("{:?} msg: {:?}", std::thread::current(), msg);
+                match msg {
+                    SomeMsg::Task(task) => {
+                        let task = *task.lock().unwrap() as *mut GTask;
+                        unsafe { g_task_return_boolean(task, 1) }
+                    }
                 }
-            }
+            });
         }
     }
 }
 
 #[no_mangle]
 fn rs_init() {
-    eprintln!("enter rs_init()");
+    eprintln!("{:?} enter rs_init()", std::thread::current());
 
     let (_sender, receiver) = futures::channel::mpsc::channel::<SomeMsg>(10240);
 
@@ -50,13 +56,17 @@ fn rs_init() {
 
     // Spawn a thread to run a Tokio event loop
     thread::spawn(move || {
-        use tokio::runtime::Runtime;
+        use tokio::runtime::Builder;
 
-        let mut rt = Runtime::new().unwrap();
+        let mut rt = Builder::new()
+            .threaded_scheduler()
+            .core_threads(3)
+            .build()
+            .unwrap();
         rt.block_on(rs_worker(receiver));
     });
 
-    eprintln!("exit rs_init()");
+    eprintln!("{:?} exit rs_init()", std::thread::current());
 }
 
 #[no_mangle]
@@ -71,17 +81,10 @@ pub fn rs_do_something_async(callback: GAsyncReadyCallback, user_data: gpointer)
 
     let new_task = task.clone();
 
-    #[cfg(disabled)]
-    thread::spawn(move || {
-        let new_task = *new_task.lock().unwrap() as *mut GTask;
-        unsafe { g_task_return_boolean(new_task, 1) }
-    });
-
-    let sender;
-    unsafe {
-        sender = SENDER.clone();
-    };
+    let sender = unsafe { SENDER.clone() };
+    eprintln!("{:?} Sending task down", std::thread::current());
     block_on(sender.unwrap().send(SomeMsg::Task(new_task))).unwrap();
+    eprintln!("{:?} Sent task down", std::thread::current());
 }
 
 #[cfg(test)]
