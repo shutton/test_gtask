@@ -11,7 +11,9 @@ gio-sys = "0.9.1"
 glib = "0.9.3"
 gobject-sys = "0.9.1"
 glib-sys = "0.9.1"
+futures = { version = "0.3.5", features = ["thread-pool"] }
 tokio = { version = "0.2.21", features = ["full"] }
+futures-util = "0.3.5"
 
 [lib]
 name = "rust_gtask"
