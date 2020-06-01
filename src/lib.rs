@@ -1,27 +1,52 @@
 use futures::executor::block_on;
 use futures_util::{SinkExt, StreamExt};
-use gio_sys::{
-    g_cancellable_new, g_task_new, g_task_return_boolean, GAsyncReadyCallback, GAsyncResult, GTask,
-};
+use gio_sys::{g_task_new, g_task_return_boolean, GAsyncReadyCallback, GAsyncResult, GTask};
 use glib_sys::{gpointer, GError};
-use gobject_sys::{g_object_new, g_object_unref, GObject, G_TYPE_OBJECT};
+use gobject_sys::{g_object_unref, GObject};
 use std::{
     sync::{Arc, Mutex},
     thread,
 };
 
-static mut SENDER: Option<Mutex<futures::channel::mpsc::Sender<SomeMsg>>> = None;
+pub struct State {
+    sender: Arc<Mutex<futures::channel::mpsc::Sender<SomeMsg>>>,
+    workers: std::thread::JoinHandle<()>,
+}
+
+impl State {
+    pub fn new(
+        sender: futures::channel::mpsc::Sender<SomeMsg>,
+        workers: std::thread::JoinHandle<()>,
+    ) -> Self {
+        State {
+            sender: Arc::new(Mutex::new(sender)),
+            workers,
+        }
+    }
+
+    pub fn send(&self, msg: SomeMsg) {
+        block_on((self.sender.lock().unwrap()).send(msg)).unwrap();
+    }
+
+    pub fn join_workers(self) {
+        eprintln!(
+            "{:?} waiting for Tokio thread to complete",
+            std::thread::current()
+        );
+        self.workers.join().unwrap();
+    }
+}
 
 #[derive(Debug)]
-enum SomeMsg {
+pub enum SomeMsg {
     Task(Arc<Mutex<usize>>),
     Terminate,
 }
 
 #[no_mangle]
 pub fn rs_do_something_finish(
-    _src: GObject,
-    result: *mut gio_sys::GAsyncResult,
+    _src: *mut GObject,
+    result: *mut GAsyncResult,
     _error: &mut GError,
 ) -> usize {
     eprintln!(
@@ -29,7 +54,6 @@ pub fn rs_do_something_finish(
         std::thread::current(),
         result,
     );
-    // TODO: cast GAsyncResult back to the task and unref it?
 
     1
 }
@@ -40,11 +64,12 @@ async fn rs_worker(mut receiver: futures::channel::mpsc::Receiver<SomeMsg>) {
         while let Some(msg) = receiver.next().await {
             eprintln!("{:?} msg: {:?}", std::thread::current(), msg);
             match msg {
-                SomeMsg::Terminate => break,
+                SomeMsg::Terminate => return,
                 SomeMsg::Task(task) => {
                     // Perform every task in an available worker thread rather than this one
                     tokio::spawn(async move {
                         let task = *task.lock().unwrap() as *mut GTask;
+                        eprintln!("{:?} handling task {:?}", std::thread::current(), task);
                         unsafe {
                             g_task_return_boolean(task, 1);
                             g_object_unref(task as *mut gobject_sys::GObject);
@@ -57,15 +82,13 @@ async fn rs_worker(mut receiver: futures::channel::mpsc::Receiver<SomeMsg>) {
 }
 
 #[no_mangle]
-fn rs_init() {
+fn rs_init() -> *mut State {
     eprintln!("{:?} enter rs_init()", std::thread::current());
 
-    let (_sender, receiver) = futures::channel::mpsc::channel::<SomeMsg>(10240);
-
-    unsafe { SENDER = Some(Mutex::new(_sender)) };
+    let (sender, receiver) = futures::channel::mpsc::channel::<SomeMsg>(10240);
 
     // Spawn a thread to run a Tokio event loop
-    thread::spawn(move || {
+    let workers = thread::spawn(move || {
         use tokio::runtime::Builder;
 
         let mut rt = Builder::new()
@@ -76,28 +99,24 @@ fn rs_init() {
         rt.block_on(rs_worker(receiver));
     });
 
-    eprintln!("{:?} exit rs_init()", std::thread::current());
-}
+    let state = Box::new(State::new(sender, workers));
 
-fn get_sender() -> futures::channel::mpsc::Sender<SomeMsg> {
-    unsafe {
-        match &SENDER {
-            Some(sender) => {
-                let guard = sender.lock().unwrap();
-                guard.clone()
-            }
-            None => panic!("not initialized"),
-        }
-    }
+    eprintln!("{:?} exit rs_init()", std::thread::current());
+
+    Box::into_raw(state)
 }
 
 #[no_mangle]
-pub fn rs_do_something_async(callback: GAsyncReadyCallback, user_data: gpointer) {
+pub fn rs_do_something_async(
+    state: *mut State,
+    callback: GAsyncReadyCallback,
+    user_data: gpointer,
+) {
     let task: Arc<Mutex<usize>>;
     unsafe {
         let raw_task = g_task_new(
-            0 as *mut gobject_sys::GObject,
-            0 as *mut gio_sys::GCancellable,
+            std::ptr::null_mut::<gobject_sys::GObject>(),
+            std::ptr::null_mut::<gio_sys::GCancellable>(),
             callback,
             user_data,
         );
@@ -105,23 +124,23 @@ pub fn rs_do_something_async(callback: GAsyncReadyCallback, user_data: gpointer)
         gobject_sys::g_object_weak_ref(
             raw_task as *mut gobject_sys::GObject,
             Some(rs_task_disposed),
-            0 as *mut std::ffi::c_void,
+            std::ptr::null_mut::<std::ffi::c_void>(),
         );
         task = Arc::new(Mutex::new(raw_task as usize));
     }
 
     let new_task = task.clone();
 
-    let mut sender = get_sender();
     eprintln!("{:?} Sending task down", std::thread::current());
-    block_on(sender.send(SomeMsg::Task(new_task))).unwrap();
+    unsafe { state.as_ref().unwrap().send(SomeMsg::Task(new_task)) };
     eprintln!("{:?} Sent task down", std::thread::current());
 }
 
 #[no_mangle]
-pub fn rs_done() {
-    let mut sender = get_sender();
-    block_on(sender.send(SomeMsg::Terminate)).unwrap();
+pub unsafe fn rs_done(state: *mut State) {
+    let state = Box::from_raw(state);
+    state.send(SomeMsg::Terminate);
+    state.join_workers();
 }
 
 #[no_mangle]
